@@ -24,4 +24,5 @@ PY
   fi
 fi
 
-exec gunicorn -w 1 --threads 8 --timeout 600 -b 0.0.0.0:${GANSCA_PORT:-8080} backend.app:app
+cd backend
+exec gunicorn -w 1 --threads 8 --timeout 600 -b 0.0.0.0:${GANSCA_PORT:-8080} app:app
