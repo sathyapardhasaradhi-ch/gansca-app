@@ -1,0 +1,15 @@
+services:
+  - type: web
+    name: gansca-app
+    env: docker
+    plan: free
+    dockerfilePath: ./Dockerfile
+    envVars:
+      - key: GANSCA_WARMUP
+        value: "1"
+      - key: GANSCA_DEBUG
+        value: "0"
+      - key: HF_MODEL_REPO
+        value: "REPLACE_WITH_your-hf-username/gansca-model"
+      - key: HF_MODEL_FILENAME
+        value: "best_gansca_3band.pth"

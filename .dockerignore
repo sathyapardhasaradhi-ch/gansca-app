@@ -1,0 +1,11 @@
+venv/
+backend/venv/
+__pycache__/
+*.pyc
+backend/model/*.pth
+backend/data/uploads/*
+backend/data/results/*
+.git/
+.gitignore
+.dockerignore
+*.md

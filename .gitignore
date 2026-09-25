@@ -1,0 +1,14 @@
+# runtime data
+backend/data/uploads/*
+backend/data/results/*
+!backend/data/uploads/.gitkeep
+!backend/data/results/.gitkeep
+# model weights (large binary)
+backend/model/*.pth
+# python
+__pycache__/
+*.pyc
+venv/
+.venv/
+.DS_Store
+.env

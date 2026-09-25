@@ -1,0 +1,575 @@
+import os
+import glob
+import csv
+import random
+import argparse
+import numpy as np
+from PIL import Image
+import torch
+import torch.nn as nn
+import torch.optim as optim
+from torch.utils.data import Dataset, DataLoader
+import torch.nn.functional as F
+from rich.console import Console
+from rich.progress import Progress, SpinnerColumn, BarColumn, TextColumn, TimeRemainingColumn
+from rich.panel import Panel
+from rich.table import Table
+
+_console_early = __import__('rich.console', fromlist=['Console']).Console()
+if not torch.cuda.is_available():
+    from rich.panel import Panel as _Panel
+    _console_early.print(_Panel.fit(
+        "[bold red]❌ CUDA NOT AVAILABLE[/bold red]\n"
+        "[white]This training script strictly requires a CUDA-capable GPU.\n"
+        "CPU fallback is disabled to protect training speed and model quality.\n\n"
+        "Please ensure:\n"
+        "  • An NVIDIA GPU is present\n"
+        "  • CUDA drivers are installed\n"
+        "  • PyTorch was installed with CUDA support (e.g. torch+cu121)"
+        "[/white]",
+        border_style="red",
+    ))
+    raise SystemExit(1)
+
+device = torch.device('cuda')
+torch.backends.cudnn.benchmark   = True   # auto-tune kernels for fixed input size
+torch.backends.cudnn.deterministic = False # allow non-deterministic for max speed
+
+class BuildingDataset(Dataset):
+    """
+    RAM-preloaded dataset for maximum GPU throughput.
+    All tiles are loaded into a single contiguous float32 tensor during __init__,
+    so __getitem__ is a pure index lookup — zero disk I/O during training.
+
+    Memory estimate for 256×256 RGB tiles:
+      images: N × 3 × 256 × 256 × 4 bytes  ≈  N × 0.75 MB
+      masks:  N × 1 × 256 × 256 × 4 bytes  ≈  N × 0.25 MB
+      7 331 train → ~7.3 GB   |   1 832 val → ~1.8 GB   |   Total ≈ 9.1 GB
+    """
+    def __init__(self, img_dir, label_dir, patch_size=256, is_val=False):
+        self.patch_size = patch_size
+        self.is_val     = is_val
+
+        all_imgs = sorted(glob.glob(os.path.join(img_dir, "*.png")))
+        pairs = []
+        missing = 0
+        for img_path in all_imgs:
+            base = os.path.basename(img_path)
+            mask_path = os.path.join(label_dir, base)
+            mask_path_alt = os.path.join(label_dir, os.path.splitext(base)[0] + "_mask" + os.path.splitext(base)[1])
+            
+            if os.path.exists(mask_path):
+                pairs.append((img_path, mask_path))
+            elif os.path.exists(mask_path_alt):
+                pairs.append((img_path, mask_path_alt))
+            else:
+                missing += 1
+
+        tag = "Val" if is_val else "Train"
+        if len(pairs) == 0:
+            raise ValueError(f"{tag}: No valid image-label pairs found in {img_dir}")
+
+        # ── Pre-load everything into RAM ──────────────────────────────────
+        from rich.progress import Progress, SpinnerColumn, BarColumn, TextColumn, TimeElapsedColumn
+        n = len(pairs)
+        self.images = torch.zeros(n, 3, patch_size, patch_size, dtype=torch.float32)
+        self.masks  = torch.zeros(n, 1, patch_size, patch_size, dtype=torch.float32)
+
+        with Progress(
+            SpinnerColumn(),
+            TextColumn(f"[bold cyan]\u23f3 {tag}: pre-loading {{task.completed}}/{{task.total}} tiles into RAM"),
+            BarColumn(),
+            TextColumn("[progress.percentage]{task.percentage:>3.0f}%"),
+            TimeElapsedColumn(),
+        ) as progress:
+            task = progress.add_task("Loading", total=n)
+            for i, (img_path, mask_path) in enumerate(pairs):
+                img  = np.array(Image.open(img_path ).convert('RGB'), dtype=np.float32) / 255.0
+                mask = np.array(Image.open(mask_path).convert('L'),   dtype=np.float32) / 255.0
+                img  = img.transpose(2, 0, 1)                # (3, H, W)
+                mask = (mask > 0.5).astype(np.float32)       # binary
+
+                h, w = img.shape[1], img.shape[2]
+                ps   = patch_size
+                if h < ps or w < ps:
+                    self.images[i, :, :h, :w] = torch.from_numpy(img)
+                    self.masks [i, 0, :h, :w] = torch.from_numpy(mask)
+                elif h == ps and w == ps:
+                    self.images[i] = torch.from_numpy(img)
+                    self.masks [i, 0] = torch.from_numpy(mask)
+                else:
+                    y = random.randint(0, h - ps)
+                    x = random.randint(0, w - ps)
+                    self.images[i] = torch.from_numpy(img[:, y:y+ps, x:x+ps])
+                    self.masks [i, 0] = torch.from_numpy(mask[y:y+ps, x:x+ps])
+
+                progress.update(task, advance=1)
+
+        ram_gb = (self.images.nbytes + self.masks.nbytes) / (1024 ** 3)
+        print(f"[{tag}] {n} pairs loaded into RAM ({ram_gb:.2f} GB).  {missing} skipped.")
+
+    def __len__(self):
+        return self.images.shape[0]
+
+    def __getitem__(self, idx):
+        img  = self.images[idx]    # already float32 tensor
+        mask = self.masks[idx]
+
+        # Light on-the-fly flip for train (data already augmented but this adds variety)
+        if not self.is_val:
+            if random.random() > 0.5:
+                img  = img.flip(2)     # horizontal
+                mask = mask.flip(2)
+            if random.random() > 0.5:
+                img  = img.flip(1)     # vertical
+                mask = mask.flip(1)
+
+        return img, mask
+
+# Architecture
+class ChannelAttention(nn.Module):
+    def __init__(self, in_planes, ratio=8):
+        super(ChannelAttention, self).__init__()
+        self.avg_pool = nn.AdaptiveAvgPool2d(1)
+        self.max_pool = nn.AdaptiveMaxPool2d(1)
+        self.fc = nn.Sequential(
+            nn.Conv2d(in_planes, in_planes // ratio, 1, bias=False),
+            nn.ReLU(),
+            nn.Conv2d(in_planes // ratio, in_planes, 1, bias=False)
+        )
+        self.sigmoid = nn.Sigmoid()
+
+    def forward(self, x):
+        avg_out = self.fc(self.avg_pool(x))
+        max_out = self.fc(self.max_pool(x))
+        return self.sigmoid(avg_out + max_out)
+
+class SpatialAttention(nn.Module):
+    def __init__(self, kernel_size=7):
+        super(SpatialAttention, self).__init__()
+        self.conv1 = nn.Conv2d(2, 1, kernel_size, padding=kernel_size//2, bias=False)
+        self.sigmoid = nn.Sigmoid()
+
+    def forward(self, x):
+        avg_out = torch.mean(x, dim=1, keepdim=True)
+        max_out, _ = torch.max(x, dim=1, keepdim=True)
+        x_cat = torch.cat([avg_out, max_out], dim=1)
+        out = self.conv1(x_cat)
+        return self.sigmoid(out)
+
+class SCABlock(nn.Module):
+    def __init__(self, in_channels):
+        super(SCABlock, self).__init__()
+        self.ca = ChannelAttention(in_channels)
+        self.sa = SpatialAttention()
+    def forward(self, x):
+        x = x * self.ca(x)
+        x = x * self.sa(x)
+        return x
+
+class DoubleConv(nn.Module):
+    def __init__(self, in_channels, out_channels):
+        super(DoubleConv, self).__init__()
+        self.conv = nn.Sequential(
+            nn.Conv2d(in_channels, out_channels, 3, padding=1, bias=False),
+            nn.BatchNorm2d(out_channels),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(out_channels, out_channels, 3, padding=1, bias=False),
+            nn.BatchNorm2d(out_channels),
+            nn.ReLU(inplace=True)
+        )
+    def forward(self, x):
+        return self.conv(x)
+
+class GeneratorSCA(nn.Module):
+    def __init__(self, in_channels=3, out_channels=1):
+        super(GeneratorSCA, self).__init__()
+        self.inc = DoubleConv(in_channels, 64)
+        self.down1 = nn.Sequential(nn.MaxPool2d(2), DoubleConv(64, 128))
+        self.down2 = nn.Sequential(nn.MaxPool2d(2), DoubleConv(128, 256))
+        self.down3 = nn.Sequential(nn.MaxPool2d(2), DoubleConv(256, 512))
+        self.down4 = nn.Sequential(nn.MaxPool2d(2), DoubleConv(512, 1024))
+        self.sca_bot = SCABlock(1024)
+        
+        self.up1 = nn.ConvTranspose2d(1024, 512, kernel_size=2, stride=2)
+        self.conv_up1 = DoubleConv(1024, 512)
+        self.sca_up1 = SCABlock(512)
+        
+        self.up2 = nn.ConvTranspose2d(512, 256, kernel_size=2, stride=2)
+        self.conv_up2 = DoubleConv(512, 256)
+        self.up3 = nn.ConvTranspose2d(256, 128, kernel_size=2, stride=2)
+        self.conv_up3 = DoubleConv(256, 128)
+        self.up4 = nn.ConvTranspose2d(128, 64, kernel_size=2, stride=2)
+        self.conv_up4 = DoubleConv(128, 64)
+        self.outc = nn.Sequential(nn.Conv2d(64, out_channels, 1), nn.Sigmoid())
+
+    def forward(self, x):
+        x1 = self.inc(x)
+        x2 = self.down1(x1)
+        x3 = self.down2(x2)
+        x4 = self.down3(x3)
+        bn = self.down4(x4)
+        bn = self.sca_bot(bn)
+        
+        u1 = self.up1(bn)
+        u1 = torch.cat([u1, x4], dim=1)
+        u1 = self.conv_up1(u1)
+        u1 = self.sca_up1(u1)
+        
+        u2 = self.up2(u1)
+        u2 = torch.cat([u2, x3], dim=1)
+        u2 = self.conv_up2(u2)
+        
+        u3 = self.up3(u2)
+        u3 = torch.cat([u3, x2], dim=1)
+        u3 = self.conv_up3(u3)
+        
+        u4 = self.up4(u3)
+        u4 = torch.cat([u4, x1], dim=1)
+        u4 = self.conv_up4(u4)
+        return self.outc(u4)
+
+class DiscriminatorPatchGAN(nn.Module):
+    def __init__(self, in_channels=4): # 3 for image + 1 for mask
+        super(DiscriminatorPatchGAN, self).__init__()
+        def discriminator_block(in_filters, out_filters, normalization=True):
+            layers = [nn.Conv2d(in_filters, out_filters, 4, stride=2, padding=1)]
+            if normalization:
+                layers.append(nn.InstanceNorm2d(out_filters))
+            layers.append(nn.LeakyReLU(0.2, inplace=True))
+            return layers
+        self.model = nn.Sequential(
+            *discriminator_block(in_channels, 64, normalization=False),
+            *discriminator_block(64, 128),
+            *discriminator_block(128, 256),
+            *discriminator_block(256, 512),
+            nn.ZeroPad2d((1, 0, 1, 0)),
+            nn.Conv2d(512, 1, 4, padding=1, bias=False)
+        )
+    def forward(self, img_A, img_B):
+        img_input = torch.cat((img_A, img_B), 1)
+        return self.model(img_input)
+
+class DiceLoss(nn.Module):
+    def __init__(self, smooth=1.0):
+        super(DiceLoss, self).__init__()
+        self.smooth = smooth
+    def forward(self, pred, target):
+        pred = pred.contiguous()
+        target = target.contiguous()
+        intersection = (pred * target).sum(dim=2).sum(dim=2)
+        return (1 - ((2. * intersection + self.smooth) / (pred.sum(dim=2).sum(dim=2) + target.sum(dim=2).sum(dim=2) + self.smooth))).mean()
+
+def calculate_metrics(pred, target, threshold=0.5):
+    pred_bin = (pred > threshold).float()
+    
+    tp = torch.sum(pred_bin * target).item()
+    fp = torch.sum(pred_bin * (1 - target)).item()
+    fn = torch.sum((1 - pred_bin) * target).item()
+    tn = torch.sum((1 - pred_bin) * (1 - target)).item()
+    
+    iou       = tp / (tp + fp + fn + 1e-8)
+    precision = tp / (tp + fp + 1e-8)
+    recall    = tp / (tp + fn + 1e-8)
+    f1        = 2 * precision * recall / (precision + recall + 1e-8)
+    pixel_acc = (tp + tn) / (tp + tn + fp + fn + 1e-8)
+    specificity = tn / (tn + fp + 1e-8)
+    
+    mcc_num = (tp * tn) - (fp * fn)
+    mcc_den = ((tp + fp) * (tp + fn) * (tn + fp) * (tn + fn)) ** 0.5
+    mcc = mcc_num / (mcc_den + 1e-8)
+    
+    return iou, f1, precision, recall, specificity, mcc, pixel_acc, tp, fp, fn, tn
+
+
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--epochs",         type=int,   default=40)
+    parser.add_argument("--batch_size",     type=int,   default=32)
+    parser.add_argument("--patch_size",     type=int,   default=256)
+    parser.add_argument("--num_workers",    type=int,   default=4,
+                        help="DataLoader worker processes (0 = main thread only)")
+    parser.add_argument("--img_path",       type=str,   default="../data/augmented/train_images")
+    parser.add_argument("--label_path",     type=str,   default="../data/augmented/train_labels")
+    parser.add_argument("--val_img_path",   type=str,   default="../data/augmented/val_images")
+    parser.add_argument("--val_label_path", type=str,   default="../data/augmented/val_labels")
+    parser.add_argument("--out_dir",        type=str,   default="./runs/default",
+                        help="Output directory for checkpoints, logs and all training artefacts")
+    parser.add_argument("--lr",             type=float, default=0.0002)
+    opts = parser.parse_args()
+
+    # ── Create output directory ───────────────────────────────────────
+    out_dir = opts.out_dir
+    os.makedirs(out_dir, exist_ok=True)
+
+    console = Console()
+
+    # Auto-detect val dirs: if user didn't set them and they don't exist,
+    # fall back to a 10% slice of training data (legacy behaviour warning)
+    val_img   = opts.val_img_path
+    val_label = opts.val_label_path
+    if not os.path.isdir(val_img) or not os.path.isdir(val_label):
+        console.print(
+            "[bold yellow]⚠  val directories not found — "
+            "falling back to sampling from train set (not ideal).[/bold yellow]\n"
+            f"    Expected: {val_img}\n"
+            "    Run Option [3] Augment to create proper train/val splits."
+        )
+        val_img   = opts.img_path
+        val_label = opts.label_path
+
+    train_dataset = BuildingDataset(opts.img_path, opts.label_path,
+                                    patch_size=opts.patch_size, is_val=False)
+    val_dataset   = BuildingDataset(val_img,       val_label,
+                                    patch_size=opts.patch_size, is_val=True)
+
+    # ── DataLoaders (num_workers=0: all data is in RAM, no I/O to overlap) ──
+    train_loader = DataLoader(
+        train_dataset, batch_size=opts.batch_size,
+        shuffle=True, drop_last=True, pin_memory=True,
+    )
+    val_loader = DataLoader(
+        val_dataset, batch_size=opts.batch_size,
+        shuffle=False, pin_memory=True,
+    )
+
+    generator = GeneratorSCA(in_channels=3, out_channels=1).to(device)
+    discriminator = DiscriminatorPatchGAN(in_channels=4).to(device)
+
+    criterion_GAN = nn.MSELoss().to(device)
+    criterion_pixelwise = nn.L1Loss().to(device)
+    criterion_bce = nn.BCELoss().to(device)
+    criterion_dice = DiceLoss().to(device)
+
+    optimizer_G = optim.Adam(generator.parameters(), lr=opts.lr, betas=(0.5, 0.999))
+    optimizer_D = optim.Adam(discriminator.parameters(), lr=opts.lr, betas=(0.5, 0.999))
+
+    # ── Leaderboard: top-3 by Val IoU ───────────────────────────────────
+    leaderboard  = []
+    TOP_K        = 3
+    csv_file     = os.path.join(out_dir, "training_log_3band.csv")
+    cm_csv_file  = os.path.join(out_dir, "confusion_matrix_log_3band.csv")
+
+    # Init training log CSV
+    with open(csv_file, mode='w', newline='') as f:
+        csv.writer(f).writerow([
+            "Epoch",
+            "Train_Loss_G", "Train_Loss_D",
+            "Val_Loss_G",
+            "Val_IoU", "Val_F1", "Val_Precision", "Val_Recall",
+            "Val_Specificity", "Val_MCC", "Val_Acc",
+            "Leaderboard_Rank", "Saved"
+        ])
+
+    # Init confusion matrix log CSV
+    with open(cm_csv_file, mode='w', newline='') as f:
+        csv.writer(f).writerow(["Epoch", "TP", "FP", "FN", "TN",
+                                 "TPR", "FPR", "FNR", "TNR"])
+        
+    console = Console()
+
+    # ── CUDA device banner ─────────────────────────────────────────
+    gpu_name  = torch.cuda.get_device_name(device)
+    vram_gb   = torch.cuda.get_device_properties(device).total_memory / (1024 ** 3)
+    vram_free = torch.cuda.memory_reserved(device) / (1024 ** 3)
+    cuda_ver  = torch.version.cuda
+    console.print(Panel.fit(
+        f"[bold green]✓ CUDA ACTIVE[/bold green]  │  "
+        f"[bold white]{gpu_name}[/bold white]  │  "
+        f"VRAM [cyan]{vram_gb:.1f} GB[/cyan]  │  "
+        f"CUDA [yellow]{cuda_ver}[/yellow]  │  "
+        f"PyTorch [dim]{torch.__version__}[/dim]",
+        border_style="green",
+    ))
+    console.print(Panel.fit(
+        f"[bold cyan]GAN-SCA 3-Band Training[/bold cyan]\n"
+        f"[white]Epochs:[/white] [yellow]{opts.epochs}[/yellow]  "
+        f"[white]Batch:[/white] [yellow]{opts.batch_size}[/yellow]  "
+        f"[white]Patch:[/white] [yellow]{opts.patch_size}×{opts.patch_size}[/yellow]  "
+        f"[white]LR:[/white] [yellow]{opts.lr}[/yellow]\n"
+        f"[white]Train:[/white] [dim]{opts.img_path}[/dim]\n"
+        f"[white]Val  :[/white] [dim]{val_img}[/dim]\n"
+        f"[white]Out  :[/white] [bold cyan]{out_dir}[/bold cyan]",
+        border_style="cyan",
+    ))
+
+    with Progress(
+        SpinnerColumn(),
+        TextColumn("[progress.description]{task.description}"),
+        BarColumn(),
+        TextColumn("[progress.percentage]{task.percentage:>3.0f}%"),
+        TimeRemainingColumn(),
+        console=console
+    ) as progress:
+        
+        epoch_task = progress.add_task("[bold blue]Overall Progress", total=opts.epochs)
+
+        for epoch in range(1, opts.epochs + 1):
+            generator.train()
+            discriminator.train()
+            
+            epoch_g_loss = 0.0
+            epoch_d_loss = 0.0
+            
+            batch_task = progress.add_task(f"[green]Epoch {epoch}/{opts.epochs} Train", total=len(train_loader))
+            
+            for i, (imgs, masks) in enumerate(train_loader):
+                imgs  = imgs.to(device, non_blocking=True)
+                masks = masks.to(device, non_blocking=True)
+
+                patch_shape = (imgs.size(0), 1, imgs.size(2) // 16, imgs.size(3) // 16)
+                # Create directly on GPU — no CPU→GPU hop per batch
+                valid = torch.ones( patch_shape, device=device, requires_grad=False)
+                fake  = torch.zeros(patch_shape, device=device, requires_grad=False)
+
+                # Generator
+                optimizer_G.zero_grad()
+                gen_masks = generator(imgs)
+                
+                loss_GAN = criterion_GAN(discriminator(gen_masks, imgs), valid)
+                loss_pixel = criterion_pixelwise(gen_masks, masks)
+                loss_b = criterion_bce(gen_masks, masks)
+                loss_d = criterion_dice(gen_masks, masks)
+
+                loss_G = loss_GAN + (100 * loss_pixel) + loss_b + (10.0 * loss_d)
+
+                loss_G.backward()
+                optimizer_G.step()
+
+                # Discriminator
+                optimizer_D.zero_grad()
+                loss_real = criterion_GAN(discriminator(masks, imgs), valid)
+                loss_fake = criterion_GAN(discriminator(gen_masks.detach(), imgs), fake)
+                loss_D = 0.5 * (loss_real + loss_fake)
+
+                loss_D.backward()
+                optimizer_D.step()
+
+                epoch_g_loss += loss_G.item()
+                epoch_d_loss += loss_D.item()
+                progress.update(batch_task, advance=1, description=f"[green]Epoch {epoch}/{opts.epochs}[/green] [dim]D: {loss_D.item():.3f} G: {loss_G.item():.3f}[/dim]")
+
+            # ── Validation ───────────────────────────────────────────────
+            generator.eval()
+            metric_sums  = np.zeros(11)   # iou,f1,prec,rec,spec,mcc,acc,tp,fp,fn,tn
+            val_loss_sum = 0.0
+            val_task = progress.add_task(f"[yellow]Epoch {epoch} Validating...", total=len(val_loader))
+            
+            with torch.no_grad():
+                for imgs, masks in val_loader:
+                    imgs  = imgs.to(device,  non_blocking=True)
+                    masks = masks.to(device, non_blocking=True)
+                    gen_masks = generator(imgs)
+
+                    # Validation loss (same composite as generator, no GAN term)
+                    vl_pixel = criterion_pixelwise(gen_masks, masks)
+                    vl_bce   = criterion_bce(gen_masks, masks)
+                    vl_dice  = criterion_dice(gen_masks, masks)
+                    val_loss_sum += (100 * vl_pixel + vl_bce + 10.0 * vl_dice).item()
+
+                    metrics = calculate_metrics(gen_masks, masks)
+                    metric_sums += np.array(metrics)
+                    progress.update(val_task, advance=1)
+                    
+            metric_avgs = metric_sums / len(val_loader)
+            val_iou, val_f1, val_prec, val_rec, val_spec, val_mcc, val_acc, \
+                cm_tp, cm_fp, cm_fn, cm_tn = metric_avgs
+            val_loss_avg = val_loss_sum / len(val_loader)
+
+            # ── Confusion matrix CSV log ─────────────────────────────────
+            total_px = cm_tp + cm_fp + cm_fn + cm_tn + 1e-8
+            with open(cm_csv_file, mode='a', newline='') as f:
+                csv.writer(f).writerow([
+                    epoch,
+                    f"{cm_tp:.0f}", f"{cm_fp:.0f}",
+                    f"{cm_fn:.0f}", f"{cm_tn:.0f}",
+                    f"{cm_tp / (cm_tp + cm_fn + 1e-8):.5f}",   # TPR (Recall)
+                    f"{cm_fp / (cm_fp + cm_tn + 1e-8):.5f}",   # FPR
+                    f"{cm_fn / (cm_tp + cm_fn + 1e-8):.5f}",   # FNR (Miss rate)
+                    f"{cm_tn / (cm_tn + cm_fp + 1e-8):.5f}",   # TNR (Specificity)
+                ])
+
+            # ── Top-3 Leaderboard save ───────────────────────────────────
+            leaderboard_rank = None
+            candidate_path   = os.path.join(out_dir, f"checkpoint_ep{epoch:04d}_iou{val_iou:.4f}.pth")
+
+            qualifies = len(leaderboard) < TOP_K or val_iou > leaderboard[-1]["iou"]
+            if qualifies:
+                torch.save(generator.state_dict(), candidate_path)
+                leaderboard.append({
+                    "epoch": epoch, "iou": val_iou, "f1": val_f1,
+                    "mcc": val_mcc, "path": candidate_path
+                })
+                # Sort descending best→worst
+                leaderboard.sort(key=lambda x: x["iou"], reverse=True)
+                # Evict rank-4+ and delete their checkpoint files
+                while len(leaderboard) > TOP_K:
+                    evicted = leaderboard.pop()
+                    if os.path.exists(evicted["path"]):
+                        os.remove(evicted["path"])
+                # Find rank of this epoch
+                for r, entry in enumerate(leaderboard, start=1):
+                    if entry["epoch"] == epoch:
+                        leaderboard_rank = r
+                        break
+
+            # ── Console epoch line ───────────────────────────────────────
+            train_g_avg = epoch_g_loss / len(train_loader)
+            train_d_avg = epoch_d_loss / len(train_loader)
+            vram_used   = torch.cuda.memory_allocated(device) / (1024 ** 3)
+            vram_total  = torch.cuda.get_device_properties(device).total_memory / (1024 ** 3)
+            rank_badges = {1: "🥇", 2: "🥈", 3: "🥉"}
+            rank_tag = (
+                f" | [bold yellow]{rank_badges.get(leaderboard_rank, '')} RANK #{leaderboard_rank}[/bold yellow]"
+                if leaderboard_rank else ""
+            )
+            status_text = (
+                f"TrainG:[cyan]{train_g_avg:.3f}[/cyan] "
+                f"TrainD:[dim]{train_d_avg:.3f}[/dim] "
+                f"ValLoss:[yellow]{val_loss_avg:.3f}[/yellow] "
+                f"IoU:[green]{val_iou:.4f}[/green] "
+                f"Rec:[magenta]{val_rec:.4f}[/magenta] "
+                f"MCC:[blue]{val_mcc:.4f}[/blue] "
+                f"VRAM:[bright_green]{vram_used:.1f}/{vram_total:.0f}GB[/bright_green]"
+            )
+            console.print(f"[bold cyan]➜ Epoch {epoch}[/bold cyan] | {status_text}{rank_tag}")
+
+            # ── Live leaderboard table ───────────────────────────────────
+            lb_table = Table(title="[bold]🏆 Top-3 Leaderboard[/bold]", border_style="yellow", show_header=True)
+            lb_table.add_column("Rank",  justify="center", style="bold yellow", width=6)
+            lb_table.add_column("Epoch", justify="center")
+            lb_table.add_column("IoU",   justify="center", style="bold green")
+            lb_table.add_column("F1",    justify="center", style="cyan")
+            lb_table.add_column("MCC",   justify="center", style="blue")
+            lb_table.add_column("Checkpoint", style="dim")
+            medals = ["🥇", "🥈", "🥉"]
+            for rank_i, entry in enumerate(leaderboard, start=1):
+                is_new = entry["epoch"] == epoch and leaderboard_rank is not None
+                lb_table.add_row(
+                    f"{medals[rank_i-1]} #{rank_i}",
+                    f"[bold]{entry['epoch']}[/bold]" if is_new else str(entry["epoch"]),
+                    f"{entry['iou']:.4f}",
+                    f"{entry['f1']:.4f}",
+                    f"{entry['mcc']:.4f}",
+                    os.path.basename(entry["path"]),
+                )
+            console.print(lb_table)
+
+            progress.remove_task(batch_task)
+            progress.remove_task(val_task)
+            progress.update(epoch_task, advance=1)
+
+            # ── Training log CSV ─────────────────────────────────────────
+            with open(csv_file, mode='a', newline='') as f:
+                csv.writer(f).writerow([
+                    epoch,
+                    f"{train_g_avg:.5f}", f"{train_d_avg:.5f}",
+                    f"{val_loss_avg:.5f}",
+                    f"{val_iou:.5f}", f"{val_f1:.5f}", f"{val_prec:.5f}",
+                    f"{val_rec:.5f}", f"{val_spec:.5f}", f"{val_mcc:.5f}", f"{val_acc:.5f}",
+                    leaderboard_rank if leaderboard_rank else "",
+                    "Yes" if leaderboard_rank else "No"
+                ])
+
+if __name__ == "__main__":
+    main()

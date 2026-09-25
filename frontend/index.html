@@ -1,0 +1,156 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>GAN-SCA · Building Footprint Extraction</title>
+
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+  <link href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@400;500;600;700&family=Inter:wght@400;500;600&family=IBM+Plex+Mono:wght@400;500;600&display=swap" rel="stylesheet" />
+
+  <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css"
+        integrity="sha256-p4NxAoJBhIIN+hmNHrzRCf9tD/miZyoHS5obTRR9BMY=" crossorigin="" />
+  <link rel="stylesheet" href="css/styles.css" />
+</head>
+<body>
+  <div class="app">
+    <!-- ===================== SIDEBAR / CONSOLE ===================== -->
+    <aside class="console" id="console">
+      <header class="console__head">
+        <div class="brand">
+          <span class="brand__mark" aria-hidden="true"></span>
+          <div class="brand__text">
+            <h1 class="brand__title">GAN-SCA</h1>
+            <p class="brand__sub">Building Footprint Extraction</p>
+          </div>
+        </div>
+        <div class="status-chip" id="statusChip" title="Backend status">
+          <span class="status-chip__dot" id="statusDot"></span>
+          <span class="status-chip__label" id="statusLabel">connecting…</span>
+        </div>
+      </header>
+
+      <div class="console__scroll">
+        <!-- Ingest -->
+        <section class="panel" aria-labelledby="ingest-h">
+          <div class="panel__eyebrow" id="ingest-h">Ingest</div>
+
+          <div class="dropzone" id="dropzone" tabindex="0" role="button"
+               aria-label="Upload a GeoTIFF image">
+            <input type="file" id="fileInput" accept=".tif,.tiff" hidden />
+            <div class="dropzone__inner">
+              <div class="dropzone__icon" aria-hidden="true">
+                <svg viewBox="0 0 24 24" width="26" height="26" fill="none"
+                     stroke="currentColor" stroke-width="1.6">
+                  <path d="M12 16V4m0 0L7.5 8.5M12 4l4.5 4.5" stroke-linecap="round" stroke-linejoin="round"/>
+                  <path d="M4 15v3a2 2 0 002 2h12a2 2 0 002-2v-3" stroke-linecap="round"/>
+                </svg>
+              </div>
+              <p class="dropzone__title">Drop a 3-band GeoTIFF</p>
+              <p class="dropzone__hint">or click to browse · .tif / .tiff</p>
+            </div>
+          </div>
+
+          <div class="file-tag" id="fileTag" hidden>
+            <span class="file-tag__name" id="fileName">—</span>
+            <button class="file-tag__clear" id="fileClear" aria-label="Remove file">×</button>
+          </div>
+
+          <div class="btn-row">
+            <button class="btn btn--primary" id="runBtn" disabled>
+              <span class="btn__label">Detect buildings</span>
+            </button>
+            <button class="btn btn--ghost" id="demoBtn" title="Load a pre-computed Kolkata result">
+              Load demo
+            </button>
+          </div>
+
+          <!-- Progress -->
+          <div class="progress" id="progress" hidden>
+            <div class="progress__meta">
+              <span class="progress__stage" id="progStage">Working…</span>
+              <span class="progress__pct" id="progPct"></span>
+            </div>
+            <div class="progress__track">
+              <div class="progress__bar" id="progBar"></div>
+            </div>
+          </div>
+
+          <p class="notice" id="notice" hidden></p>
+        </section>
+
+        <!-- Telemetry / results readout -->
+        <section class="panel readout" id="readout" hidden aria-labelledby="readout-h">
+          <div class="panel__eyebrow" id="readout-h">Readout</div>
+
+          <div class="readout__hero">
+            <span class="readout__count" id="rCount">0</span>
+            <span class="readout__count-label">building footprints</span>
+          </div>
+
+          <dl class="kv">
+            <div class="kv__row"><dt>Source</dt><dd id="rSource">—</dd></div>
+            <div class="kv__row"><dt>Dimensions</dt><dd id="rDims">—</dd></div>
+            <div class="kv__row"><dt>Reference</dt><dd id="rCrs">—</dd></div>
+            <div class="kv__row"><dt>Centre</dt><dd id="rCenter">—</dd></div>
+            <div class="kv__row"><dt>Total area</dt><dd id="rArea">—</dd></div>
+            <div class="kv__row"><dt>Compute</dt><dd id="rDevice">—</dd></div>
+            <div class="kv__row"><dt>Runtime</dt><dd id="rTime">—</dd></div>
+          </dl>
+
+          <div class="preview" id="previewWrap" hidden>
+            <div class="preview__label">Raster mask</div>
+            <img id="previewImg" class="preview__img" alt="Predicted building mask preview" />
+          </div>
+
+          <div class="downloads">
+            <a class="dl" id="dlMask" download>
+              <span class="dl__k">RGBA mask</span><span class="dl__x">GeoTIFF</span>
+            </a>
+            <a class="dl" id="dlVector" download>
+              <span class="dl__k">Footprints</span><span class="dl__x">GeoJSON · source CRS</span>
+            </a>
+            <a class="dl" id="dlVectorWgs" download>
+              <span class="dl__k">Footprints</span><span class="dl__x">GeoJSON · WGS84</span>
+            </a>
+          </div>
+        </section>
+      </div>
+
+      <footer class="console__foot">
+        <span>GAN with Spatial-Channel Attention</span>
+        <span class="dim">NRSC / ISRO collaboration</span>
+      </footer>
+    </aside>
+
+    <!-- ===================== MAP (HERO) ===================== -->
+    <main class="stage">
+      <div id="map" class="map"></div>
+
+      <!-- Map overlay controls -->
+      <div class="map-ctrl" id="mapCtrl" hidden>
+        <button class="chip" id="toggleBuildings" aria-pressed="true">Footprints</button>
+        <button class="chip" id="basemapBtn">Imagery</button>
+        <button class="chip" id="fitBtn" title="Zoom to footprints">Fit</button>
+      </div>
+
+      <!-- Empty state over the map -->
+      <div class="stage__empty" id="emptyState">
+        <div class="stage__empty-card">
+          <div class="scan" aria-hidden="true"><span></span></div>
+          <h2>No scene loaded</h2>
+          <p>Upload a georeferenced tile and run detection, or load the Kolkata demo to explore an extracted scene.</p>
+        </div>
+      </div>
+    </main>
+  </div>
+
+  <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"
+          integrity="sha256-20nQCchB9co0qIjJZRGuk2/Z9VM+kNiyxNV1lvTlZBo=" crossorigin=""></script>
+  <script src="js/config.js"></script>
+  <script src="js/api.js"></script>
+  <script src="js/map.js"></script>
+  <script src="js/app.js"></script>
+</body>
+</html>
